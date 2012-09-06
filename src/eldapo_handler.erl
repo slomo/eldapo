@@ -1,6 +1,16 @@
--module(erldap).
+-module(eldapo_handler).
 
--export([start/0]).
+-behaviour(gen_listener_tcp).
+
+-export([init/1,
+        handle_accept/2,
+        handle_call/3,
+        handle_cast/2,
+        handle_info/2,
+        terminate/2,
+        code_change/3]).
+
+%% Implementation of asn1 ber message handling
 
 % TODO:
 %   * improve connection handling (ensure that all sockets are closed)
@@ -10,14 +20,6 @@
 %   * implement other ldap commands
 
 
-start() ->
-    ok = asn1ct:compile('LDAP-V3'),
-    {ok, LSock} = gen_tcp:listen(1389,
-        [binary, {packet, 0}, {active, false}]),
-    {ok, Sock} = gen_tcp:accept(LSock),
-    spawn( fun() -> do_recv(Sock, <<>>, {0}),ok = gen_tcp:close(Sock) end),
-    ok = gen_tcp:close(LSock).
-
 do_recv(Sock, Recved, State) ->
     case gen_tcp:recv(Sock, 0) of
         {ok, Recv} ->
@@ -25,7 +27,7 @@ do_recv(Sock, Recved, State) ->
 
             case 'LDAP-V3':decode('LDAPMessage',Data) of
                 {ok, Packet} ->
-                    io:fwrite("Got Packet: ~p ~n",[Packet]),
+                    io:fwrite("Got Packet: ~p ~n from ~p ~n",[Packet, Data]),
                     {ok,Response, NewState} = packetHandler(Packet, State),
                     {ok,ASNResponse} = 'LDAP-V3':encode('LDAPMessage', Response),
                     io:fwrite("Respond with: ~p ~nASN1 encode: ~p ~n",[Response,ASNResponse]),
@@ -102,6 +104,7 @@ packetHandler({'LDAPMessage', MessageID, Content, Options } ,{ MessageCounter } 
 
 
 
+% FIXME: move to ldap_handler (client code)
 
 bindHandler(BindDN,Password) ->
     case {BindDN, Password} of
@@ -113,7 +116,47 @@ bindHandler(BindDN,Password) ->
             unauthorized
     end.
 
-
+% FIXME: move to libary
 
 ldapDNParser(PathString) ->
     PathString.
+
+%% behaviour gen_listner_tcp
+
+-define(TCP_PORT, 1389).
+-define(TCP_OPTS, [binary, inet,
+        {active,    false},
+        {backlog,   10},
+        {nodelay,   true},
+        {packet,    raw},
+        {reuseaddr, true}]).
+
+
+init([]) ->
+    % TODO: precompile this from rebar
+    ok = asn1ct:compile('LDAP-V3'),
+    {ok, {?TCP_PORT, ?TCP_OPTS}, nil}.
+
+
+handle_accept(Sock, State) ->
+    % TODO: get initial state here
+    Pid = spawn(fun() -> do_recv(Sock, <<>> , {0}), gen_tcp:close(Sock) end),
+    gen_tcp:controlling_process(Sock, Pid),
+    {noreply, State}.
+
+handle_call(Request, _From, State) ->
+    {reply, {illegal_request, Request}, State}.
+
+handle_cast(_Request, State) ->
+    {noreply, State}.
+
+handle_info(_Info, State) ->
+    {noreply, State}.
+
+terminate(_Reason, _State) ->
+    ok.
+
+code_change(_OldVsn, State, _Extra) ->
+    {ok, State}.
+
+
