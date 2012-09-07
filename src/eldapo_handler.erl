@@ -29,6 +29,7 @@ do_recv(Sock, Recved, State) ->
                 {ok, Packet} ->
                     io:fwrite("Got Packet: ~p ~n from ~p ~n",[Packet, Data]),
                     {ok,Response, NewState} = packetHandler(Packet, State),
+                    io:fwrite("Resp: ~p ~n",[Response]),
                     {ok,ASNResponse} = 'LDAP-V3':encode('LDAPMessage', Response),
                     io:fwrite("Respond with: ~p ~nASN1 encode: ~p ~n",[Response,ASNResponse]),
                     gen_tcp:send(Sock, ASNResponse),
@@ -38,6 +39,7 @@ do_recv(Sock, Recved, State) ->
                     do_recv(Sock, Data, State)
             end;
         {error, closed} ->
+            gen_tcp:close(Sock),
             ok
     end.
 
@@ -74,8 +76,8 @@ packetHandler({'LDAPMessage', MessageID, Content, Options } ,{ MessageCounter } 
                         { bindResponse,
                             { 'BindResponse',
                                 success,        % result code
-                                asn1_NOVALUE,   % mathedDn ???
-                                asn1_NOVALUE,    % Error message ???
+                                "",             % mathedDn, must be string
+                                "",             % Error message, must be string
                                 asn1_NOVALUE,   % regerral (optional)
                                 asn1_NOVALUE    % serverSaslCreds
                             }
@@ -88,18 +90,20 @@ packetHandler({'LDAPMessage', MessageID, Content, Options } ,{ MessageCounter } 
                         { bindResponse,
                             { 'BindResponse',
                                 invalidCredentials,
-                                asn1_NOVALUE,   % mathedDn ???
-                                asn1_NOVALUE,   % mathedDn ???
-                                %"BindDN or Password was wrong",
+                                "",             % mathedDn ???
+                                "",
                                 asn1_NOVALUE,   % regerral (optional)
                                 asn1_NOVALUE    % serverSaslCreds
                             }
-                        }
+                        },
+                        asn1_NOVALUE   % Options
                     }
             end,
             {ok, Response, NewState};
-        {Other, _UnprocessedContent} ->
-            io:fwrite("Unable to process ~p protocolOp",[Other])
+        {unbindRequest, 'NULL' } ->
+            ok = unbindHanlder();
+        {Other, UnprocessedContent} ->
+            io:fwrite("Unable to process ~p protocolOp: ~p",[Other, UnprocessedContent])
     end.
 
 
@@ -107,14 +111,18 @@ packetHandler({'LDAPMessage', MessageID, Content, Options } ,{ MessageCounter } 
 % FIXME: move to ldap_handler (client code)
 
 bindHandler(BindDN,Password) ->
+    io:fwrite("Tries to auth ~p ~p ~n",[BindDN,Password]),
     case {BindDN, Password} of
-        { _Any, 1234 } ->
+        { _Any, "1234" } ->
             { authorized, {BindDN} };
-        { "cn=root,o=test", 12345 } ->
+        { "cn=root,o=test", "123" } ->
             { authorized, {BindDN} };
         _ ->
             unauthorized
     end.
+
+unbindHanlder() ->
+    ok.
 
 % FIXME: move to libary
 
@@ -133,14 +141,12 @@ ldapDNParser(PathString) ->
 
 
 init([]) ->
-    % TODO: precompile this from rebar
-    ok = asn1ct:compile('LDAP-V3'),
     {ok, {?TCP_PORT, ?TCP_OPTS}, nil}.
 
 
 handle_accept(Sock, State) ->
     % TODO: get initial state here
-    Pid = spawn(fun() -> do_recv(Sock, <<>> , {0}), gen_tcp:close(Sock) end),
+    Pid = spawn(fun() -> do_recv(Sock, <<>> , {0}) end),
     gen_tcp:controlling_process(Sock, Pid),
     {noreply, State}.
 
