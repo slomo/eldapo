@@ -34,18 +34,18 @@ init([]) ->
                 % first child tcp listner
                 { gen_listener_tcp,
                     { gen_listener_tcp, start_link,
+                        % options for tcp listner
                         [
                             {local, ?REG_NAME},
                             ?GEN_LISTNER_TCP_HANDLER,
                             [], []
-                        ],
-                        permanent, brutal_kill, worker, [] }
-                },
+                        ]
+                    },
+                    permanent, brutal_kill, worker, [] },
                 % second child eldapo handler supervisor
                 { eldapo_handler_sup,
-                    { eldapo_handler_sup, start_link, [],
-                        permanent, brutal_kill, supervisor, [] }
-                }
+                    {eldapo_handler_sup,start_link, []},
+                    permanent, brutal_kill, supervisor, [] }
             ]
         }}.
 
