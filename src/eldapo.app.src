@@ -1,12 +1,17 @@
 {application, eldapo,
  [
-  {description, ""},
+  {description, "An erlang ldap server"},
   {vsn, "1"},
-  {registered, []},
+  {registered, [ eldapo ]},
   {applications, [
                   kernel,
                   stdlib
                  ]},
   {mod, { eldapo_app, []}},
-  {env, []}
+  {env, []},
+  {modules, [
+    eldapo_app,
+    eldapo_sup,
+    eldapo_handler,
+    eldapo_handler_sup ]}
  ]}.
