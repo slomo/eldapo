@@ -3,7 +3,7 @@
 -behaviour(supervisor).
 
 %% API
--export([start_link/0]).
+-export([start_link/0, start_child/0]).
 
 %% Supervisor callbacks
 -export([init/1]).
@@ -28,3 +28,15 @@ init([]) ->
             [] %  add childs here
         }}.
 
+
+start_child() ->
+    supervisor:start_child(?MODULE,
+        {
+            make_ref(),
+            { eldapo_handler, start_link, [] },
+            temporary,
+            brutal_kill,
+            worker,
+            [ eldapo_hanlde ]
+        }
+    ).
