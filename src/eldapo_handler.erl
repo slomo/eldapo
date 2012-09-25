@@ -1,14 +1,15 @@
 -module(eldapo_handler).
 
--behaviour(gen_listener_tcp).
+-export([start_link/0, inject_socket/2]).
+
+-behaviour(gen_fsm).
 
 -export([init/1,
-        handle_accept/2,
-        handle_call/3,
-        handle_cast/2,
-        handle_info/2,
-        terminate/2,
-        code_change/3]).
+        waitingForSocket/2,
+        recvData/2,
+        handle_info/3,
+        terminate/3,
+        code_change/4]).
 
 %% Implementation of asn1 ber message handling
 
@@ -20,149 +21,150 @@
 %   * implement other ldap commands
 
 
-do_recv(Sock, Recved, State) ->
-    case gen_tcp:recv(Sock, 0) of
-        {ok, Recv} ->
-            Data = << Recved/binary, Recv/binary >>,
+start_link() ->
+    gen_fsm:start_link({local, ?MODULE}, [], []).
 
-            case 'LDAP-V3':decode('LDAPMessage',Data) of
-                {ok, Packet} ->
-                    io:fwrite("Got Packet: ~p ~n from ~p ~n",[Packet, Data]),
-                    {ok,Response, NewState} = packetHandler(Packet, State),
-                    io:fwrite("Resp: ~p ~n",[Response]),
-                    {ok,ASNResponse} = 'LDAP-V3':encode('LDAPMessage', Response),
-                    io:fwrite("Respond with: ~p ~nASN1 encode: ~p ~n",[Response,ASNResponse]),
-                    gen_tcp:send(Sock, ASNResponse),
-                    do_recv(Sock, <<>>, NewState);
-                {error, Reason} ->
-                    io:fwrite("Couldn't decode: ~p ~n",[Reason]),
-                    do_recv(Sock, Data, State)
+inject_socket(Sock, Pid) ->
+    gen_tcp:controlling_process(Sock, Pid),
+    gen_fsm:send_event({socket, Sock}).
+
+% states of fsm
+
+-record(state,{
+        socket,
+        has_session = false,
+        callback = ?MODULE,
+        callback_state,
+        addr,
+        data_received,
+        message_counter = 0
+    }).
+
+init() ->
+    init([?MODULE]).
+
+init([Callback_Module]) ->
+    % FIXME: get init state
+    {ok, waitingForSocket, #state{}}.
+
+waitingForSocket({socket, Socket},State) ->
+    inet:setopts(Socket, [{active, once}, {packet, 2}, binary]),
+    {ok, {IP, _Port}} = inet:peername(Socket),
+    { next_state, recvData, State#state{socket = Socket, addr=IP}}.
+
+recvData({data, NewData, Socket}, State=#state{data_received = Recvd, socket=Socket}) ->
+    Data = << NewData/binary , Recvd/binary >>,
+    case erlang:decode_packet(asn1, Data, []) of
+        {ok, Packet, Rest} ->
+            case erlang:decode_packet(Packet, State) of
+                { reply, Reply, NewState } ->
+                    gen_tcp:send(Reply),
+                    { nextState, recvData, NewState#state{data_received = Rest }};
+                { stop, Reason, _FinalState } ->
+                    gen_tcp:close(Socket),
+                    { stop, Reason }
             end;
-        {error, closed} ->
-            gen_tcp:close(Sock),
-            ok
+        {more, _Length} ->
+            { nextState, recvData, State#state{data_received = Data} };
+        {error, _Reason} ->
+            gen_tcp:close(Socket)
     end.
 
 
+process_packet(Data, State) ->
+    case 'LDAP-V3':decode('LDAPMessage',Data) of
+        {ok, Packet} ->
+            % TODO remove io:writes
+            io:fwrite("Got Packet: ~p ~n from ~p ~n", [Packet, Data]),
 
-packetHandler({'LDAPMessage', MessageID, Content, Options } ,{ MessageCounter } ) ->
+            case handle_packet(Packet, State) of
+                {ok, Response, NewState} ->
+                    io:fwrite("Resp: ~p ~n", [Response]),
+                    {ok,ASNResponse} = 'LDAP-V3':encode('LDAPMessage', Response),
+                    { reply, ASNResponse, State};
+                Resp ->
+                    io:fwrite("Resp: ~p ~n, there for terminate"),
+                    { stop, error, State }
+            end;
+    {error, Reason} ->
+        error_logger:info_msg("Unable to decode packet, there fore shutting down! ~n Undecodeable packet: ~p ~n",[Reason]),
+        { stop, Reason, State }
+    end.
 
-    % FIXME: this is a hack! incremention can not be assumed.
-    MessageID = MessageCounter + 1,
-    NewState = { MessageCounter + 1},
 
+handle_packet({'LDAPMessage', MessageID, Content = { MessageType, _ } , Options } , State = #state{has_session = HasSession, message_counter = MessageCounter } ) ->
+
+    %% check weather package schould be handled
     if
+        MessageID < MessageCounter ->
+            { error, wrongMessageCounter };
+        MessageType =/= bindRequest and not HasSession ->
+            { error, noSession };
         Options =/= asn1_NOVALUE ->
-            io:fwrite("Reveived Options: ~p . Ignoring those",[Options]);
+            { error, optionNotSupported };
         true ->
-            skip
-    end,
 
-    case Content of
-        {bindRequest, {'BindRequest', ProtocolVersion, BindDN, Auth }} ->
+            case Content of
+                {bindRequest, {'BindRequest', ProtocolVersion, BindDN, Auth }} ->
 
-            % FIXME: only support ldapV3
-            ProtocolVersion = 3,
+                    % FIXME: only support ldapV3
+                    ProtocolVersion = 3,
 
-            % FIXME: only suport simple auth
-            { simple, Password } = Auth,
+                    % FIXME: only suport simple auth
+                    { simple, Password } = Auth,
 
-            % call bind handler
-            Response  = case bindHandler(ldapDNParser(BindDN), Password) of
-                % FIXME: handle state
-                { authorized, _ThrowAwayState } ->
-                    {'LDAPMessage',
-                        MessageID,
-                        { bindResponse,
-                            { 'BindResponse',
-                                success,        % result code
-                                "",             % mathedDn, must be string
-                                "",             % Error message, must be string
-                                asn1_NOVALUE,   % regerral (optional)
-                                asn1_NOVALUE    % serverSaslCreds
-                            }
-                        },
-                        asn1_NOVALUE   % Options
-                    };
-                unauthorized ->
-                    {'LDAPMessage',
-                        MessageID,
-                        { bindResponse,
-                            { 'BindResponse',
-                                invalidCredentials,
-                                "",             % mathedDn ???
-                                "",
-                                asn1_NOVALUE,   % regerral (optional)
-                                asn1_NOVALUE    % serverSaslCreds
-                            }
-                        },
-                        asn1_NOVALUE   % Options
-                    }
-            end,
-            {ok, Response, NewState};
-        {unbindRequest, 'NULL' } ->
-            ok = unbindHanlder();
-        {Other, UnprocessedContent} ->
-            io:fwrite("Unable to process ~p protocolOp: ~p",[Other, UnprocessedContent])
+                    % call bind handler
+                    case bindHandler(eldpo_proto:parse_dn(BindDN), Password, State#state.callback_state) of
+                        % FIXME: handle state
+                        { authorized, ModuleState } ->
+                            { reply, eldapo_proto:bind_success(MessageID),
+                                State#state{ callback_state = ModuleState, message_counter = MessageID + 1, has_session = true }};
+                        { unauthorized, _ModuleState} ->
+                            { reply, eldapo_proto:bind_failed(MessageID), State}
+                    end;
+                {unbindRequest, 'NULL' } ->
+                    { ok, _ } = unbindHanlder(),
+                    { stop, normal, State };
+                {Other, UnprocessedContent} ->
+                    io:fwrite("Unable to process ~p protocolOp: ~p",[Other, UnprocessedContent])
+            end
     end.
 
 
 
 % FIXME: move to ldap_handler (client code)
 
-bindHandler(BindDN,Password) ->
+bindHandler(BindDN, Password, State) ->
     io:fwrite("Tries to auth ~p ~p ~n",[BindDN,Password]),
     case {BindDN, Password} of
         { _Any, "1234" } ->
-            { authorized, {BindDN} };
+            { authorized, {BindDN}, State };
         { "cn=root,o=test", "123" } ->
-            { authorized, {BindDN} };
+            { authorized, {BindDN}, State };
         _ ->
-            unauthorized
+            { unauthorized, State}
     end.
 
 unbindHanlder() ->
     ok.
 
-% FIXME: move to libary
+% None fsm specific callbacks
 
-ldapDNParser(PathString) ->
-    PathString.
-
-%% behaviour gen_listner_tcp
-
--define(TCP_PORT, 1389).
--define(TCP_OPTS, [binary, inet,
-        {active,    false},
-        {backlog,   10},
-        {nodelay,   true},
-        {packet,    raw},
-        {reuseaddr, true}]).
+handle_info({tcp, Socket, Bin}, StateName, State) ->
+    inet:setopts(Socket, [{active, once}]),
+    ?MODULE:StateName({data, Bin}, State);
+handle_info({tcp_closed, Socket}, _StateName,
+    #state{socket=Socket, addr=Addr} = StateData) ->
+    error_logger:info_msg("~p Client ~p disconnected.\n", [self(), Addr]),
+    {stop, normal, StateData};
+handle_info(_Info, StateName, StateData) ->
+    {noreply, StateName, StateData}.
 
 
-init([]) ->
-    {ok, {?TCP_PORT, ?TCP_OPTS}, nil}.
-
-
-handle_accept(Sock, State) ->
-    % TODO: get initial state here
-    Pid = spawn(fun() -> do_recv(Sock, <<>> , {0}) end),
-    gen_tcp:controlling_process(Sock, Pid),
-    {noreply, State}.
-
-handle_call(Request, _From, State) ->
-    {reply, {illegal_request, Request}, State}.
-
-handle_cast(_Request, State) ->
-    {noreply, State}.
-
-handle_info(_Info, State) ->
-    {noreply, State}.
-
-terminate(_Reason, _State) ->
+terminate(_Reason, _StateName, _State) ->
     ok.
 
-code_change(_OldVsn, State, _Extra) ->
+code_change(_OldVsn, _StateName, State, _Extra) ->
     {ok, State}.
 
 
