@@ -1,4 +1,4 @@
--module(eldapo_tcp_acceptor).
+-module(eldapo_acceptor).
 
 -export([start_link/0]).
 
